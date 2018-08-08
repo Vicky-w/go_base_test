@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "io.grpc.examples.helloworld";
+option java_outer_classname = "HelloWorldProto";
+
+package helloworld;
+
+// The greeting service definition.   服务定义
+service Greeter {
+    //    // Sends a greeting
+    //    rpc SayHello (HelloRequest) returns (HelloReply) {
+    //    }
+    // Sends another greeting   发送给其他 新增内容
+    //定义方法时需定义   输入输出的message
+    rpc SayHelloAgain (HelloRequest) returns (HelloReply) {
+    }
+}
+
+// The request message containing the user's name.   请求   可理解位定义了用来传输信息的结构体对象
+message HelloRequest {
+    string name = 1;
+}
+
+// The response message containing the greetings     响应
+message HelloReply {
+    string message = 1;
+}
+
+// protoc -I helloworld/ helloworld/helloworld.proto --go_out=plugins=grpc:helloworld   //自动生成代码
