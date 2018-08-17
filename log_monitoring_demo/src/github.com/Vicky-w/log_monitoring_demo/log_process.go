@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/influxdata/influxdb/client/v2"
 	"io"
 	"log"
 	"net/http"
@@ -15,6 +14,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/influxdata/influxdb/client/v2"
+)
+
+const (
+	TypeHandleLine = iota
+	TypeErrNum
 )
 
 type Reader interface {
@@ -56,23 +62,40 @@ type SystemInfo struct {
 	RunTime      string  `json:"runTime"`      // 运行总时间
 	ErrNum       int     `json:"errNum"`       // 错误数
 }
-
-const (
-	TypeHandleLine = 0
-	TypeErrNum     = 1
-)
-
-var TypeMonitorChan = make(chan int, 200)
-
+type ReadFromTail struct {
+	// 文件读取
+	inode uint64
+	fd    *os.File
+	path  string
+}
+type InfluxConf struct {
+	//database 配置
+	Addr, Username, Password, Database, Precision string
+}
 type Monitor struct {
 	startTime time.Time
 	data      SystemInfo
 	tpsSli    []int
 }
+type ErrorInfo struct {
+	//错误信息
+	ReadErr    int `json:"readErr"`
+	ProcessErr int `json:"processErr"`
+	WriteErr   int `json:"writeErr"`
+}
+
+var TypeMonitorChan = make(chan int, 200)
 
 func (m *Monitor) start(lp *LogProcess) {
-
-	go func() {
+	/*
+		总处理日志行数
+		系统吞吐量
+		read channel 长度
+		write channnel 长度
+		运行总时间
+		错误数
+	*/
+	go func() { //消费数据
 		for n := range TypeMonitorChan {
 			switch n {
 			case TypeErrNum:
@@ -83,61 +106,65 @@ func (m *Monitor) start(lp *LogProcess) {
 		}
 	}()
 
-	ticker := time.NewTicker(time.Second * 5)
+	ticker := time.NewTicker(time.Second * 5) //定时器 tps
 	go func() {
 		for {
-			<-ticker.C
+			<-ticker.C //每5秒触发一次
 			m.tpsSli = append(m.tpsSli, m.data.HandleLine)
-			if len(m.tpsSli) > 2 {
+			if len(m.tpsSli) > 2 { //做切割 总数始终为2
 				m.tpsSli = m.tpsSli[1:]
 			}
 		}
 	}()
 
-	http.HandleFunc("/monitor", func(writer http.ResponseWriter, request *http.Request) {
-		m.data.RunTime = time.Now().Sub(m.startTime).String()
+	http.HandleFunc("/monitor", func(writer http.ResponseWriter, request *http.Request) { //暴露接口
+		m.data.RunTime = time.Now().Sub(m.startTime).String() // To compute t-d for a duration d, use t.Add(-d).  当前时间减开始时间
 		m.data.ReadChanLen = len(lp.rc)
 		m.data.WriteChanLen = len(lp.wc)
 
-		if len(m.tpsSli) >= 2 {
-			m.data.Tps = float64(m.tpsSli[1]-m.tpsSli[0]) / 5
+		if len(m.tpsSli) >= 2 { //tps 计算
+			m.data.Tps = float64(m.tpsSli[1]-m.tpsSli[0]) / 5 //定时器设置为5秒
 		}
 
 		ret, _ := json.MarshalIndent(m.data, "", "\t")
 		io.WriteString(writer, string(ret))
 	})
 
-	http.ListenAndServe(":9193", nil)
+	http.ListenAndServe(":50081", nil)
 }
 
 func (r *ReadFromFile) Read(rc chan []byte) {
+	// 读取模块
 
 	// 打开文件
 	f, err := os.Open(r.path)
 	if err != nil {
 		panic(fmt.Sprintf("open file error:%s", err.Error()))
 	}
-	//从文件末尾开始逐行读取文件
+
+	// 从文件末尾开始逐行读取文件内容
 	f.Seek(0, 2)
 	rd := bufio.NewReader(f)
 
 	for {
 		line, err := rd.ReadBytes('\n')
-		if err == io.EOF {
+		if err == io.EOF { //TODO 日志按天或按周做分割
+			//文件名会变 如果文件名变了就去重新打开文件做操作
 			time.Sleep(500 * time.Millisecond)
 			continue
 		} else if err != nil {
 			panic(fmt.Sprintf("ReadBytes error:%s", err.Error()))
 		}
-		TypeMonitorChan <- TypeHandleLine
+		TypeMonitorChan <- TypeHandleLine //标记  总日志数量
 		//rc <- line
 		//去除换行符
 		rc <- line[:len(line)-1]
 	}
-
 }
+
 func (w *WriteToInfluxDB) Write(wc chan *Message) {
-	//初始化数据
+	// 写入模块
+
 	infSli := strings.Split(w.influxDBDsn, "@")
 
 	//初始化influxdb client
@@ -159,6 +186,7 @@ func (w *WriteToInfluxDB) Write(wc chan *Message) {
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	for v := range wc {
 		// Create a new point batch
 		bp, err := client.NewBatchPoints(client.BatchPointsConfig{
@@ -189,30 +217,31 @@ func (w *WriteToInfluxDB) Write(wc chan *Message) {
 		if err := c.Write(bp); err != nil {
 			log.Fatal(err)
 		}
-
 		// Close client resources
 		//if err := c.Close(); err != nil {
 		//	log.Fatal(err)
 		//}
-		log.Println(v)
-		log.Println("write success !")
+		log.Println("write success!")
 	}
 }
 
 func (l *LogProcess) Process() {
+	// 解析模块
+
 	//从Read Channel 中读取每行日志数据
 	//正则提取所需的监控数据（path status method 等）
 	//写入Write Channel
 	/**
 	172.0.0.12 - - [04/Mar/2018:13:49:52 +0000] http "GET /vickywang?query=t HTTP/1.0" 200 2133 "-" "KeepAliveClient" "-" 1.005 1.854
 	*/
+
 	r := regexp.MustCompile(`([\d\.]+)\s+([^ \[]+)\s+([^ \[]+)\s+\[([^\]]+)\]\s+([a-z]+)\s+\"([^"]+)\"\s+(\d{3})\s+(\d+)\s+\"([^"]+)\"\s+\"(.*?)\"\s+\"([\d\.-]+)\"\s+([\d\.-]+)\s+([\d\.-]+)`)
+
 	loc, _ := time.LoadLocation("Asia/Shanghai")
 	for v := range l.rc {
-
 		ret := r.FindStringSubmatch(string(v))
 		if len(ret) != 14 {
-			TypeMonitorChan <- TypeErrNum
+			TypeMonitorChan <- TypeErrNum //错误标记
 			log.Println("FindStringSubmatch fail:", string(v))
 			continue
 		}
@@ -220,7 +249,7 @@ func (l *LogProcess) Process() {
 		message := &Message{}
 		t, err := time.ParseInLocation("02/Jan/2006:15:04:05 +0000", ret[4], loc)
 		if err != nil {
-			TypeMonitorChan <- TypeErrNum
+			TypeMonitorChan <- TypeErrNum //错误标记
 			log.Println("ParseInLocation fail:", err.Error(), ret[4])
 			continue
 		}
@@ -229,11 +258,10 @@ func (l *LogProcess) Process() {
 		byteSent, _ := strconv.Atoi(ret[8])
 		message.BytesSent = byteSent
 
-		//GET /vickywang?query=t HTTP/1.0
-
+		// GET /foo?query=t HTTP/1.0
 		reqSli := strings.Split(ret[6], " ")
 		if len(reqSli) != 3 {
-			TypeMonitorChan <- TypeErrNum
+			TypeMonitorChan <- TypeErrNum //错误标记
 			log.Println("strings.Split fail", ret[6])
 			continue
 		}
@@ -242,7 +270,7 @@ func (l *LogProcess) Process() {
 		u, err := url.Parse(reqSli[1])
 		if err != nil {
 			log.Println("url parse fail:", err)
-			TypeMonitorChan <- TypeErrNum
+			TypeMonitorChan <- TypeErrNum //错误标记
 			continue
 		}
 		message.Path = u.Path
@@ -254,8 +282,6 @@ func (l *LogProcess) Process() {
 		requestTime, _ := strconv.ParseFloat(ret[13], 64)
 		message.UpstreamTime = upstreamTime
 		message.RequestTime = requestTime
-
-		log.Println(message)
 		//log.Println(message.TimeLocal)
 		//log.Println(message.BytesSent)
 		//log.Println(message.Method)
@@ -277,19 +303,32 @@ func main() {
 	r := &ReadFromFile{
 		path: path,
 	}
+
 	w := &WriteToInfluxDB{
-		influxDBDsn: influxDsn, //用户名 密码 数据库 精度
+		influxDBDsn: influxDsn,
 	}
+
 	lp := &LogProcess{
-		rc:    make(chan []byte),
-		wc:    make(chan *Message),
+		rc:    make(chan []byte, 200), //配置缓存
+		wc:    make(chan *Message, 200),
 		read:  r,
 		write: w,
 	}
+
 	go lp.read.Read(lp.rc)
-	go lp.Process()
-	go lp.write.Write(lp.wc)
-	time.Sleep(300 * time.Second)
+	for i := 0; i < 2; i++ { //并发执行
+		go lp.Process()
+	}
+
+	for i := 0; i < 4; i++ { //并发执行
+		go lp.write.Write(lp.wc)
+	}
+	//监控程序
+	m := &Monitor{
+		startTime: time.Now(),
+		data:      SystemInfo{},
+	}
+	m.start(lp)
 }
 
 /*
